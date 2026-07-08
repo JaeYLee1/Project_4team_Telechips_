@@ -1,0 +1,8 @@
+set(__QT_DEPLOY_TARGET_pbv_weight_monitor_gui_FILE /home/pi17/pbv_system/pbv_gui/build/pbv_weight_monitor_gui)
+set(__QT_DEPLOY_TARGET_pbv_weight_monitor_gui_TYPE EXECUTABLE)
+set(__QT_DEPLOY_TARGET_pbv_temperature_gui_FILE /home/pi17/pbv_system/pbv_gui/build/pbv_temperature_gui)
+set(__QT_DEPLOY_TARGET_pbv_temperature_gui_TYPE EXECUTABLE)
+set(__QT_DEPLOY_TARGET_pbv_motor_monitor_gui_FILE /home/pi17/pbv_system/pbv_gui/build/pbv_motor_monitor_gui)
+set(__QT_DEPLOY_TARGET_pbv_motor_monitor_gui_TYPE EXECUTABLE)
+set(__QT_DEPLOY_TARGET_pbv_hmi_FILE /home/pi17/pbv_system/pbv_gui/build/pbv_hmi)
+set(__QT_DEPLOY_TARGET_pbv_hmi_TYPE EXECUTABLE)
