@@ -409,6 +409,43 @@ static bool is_valid_gui_command_char(char command)
     }
 }
 
+static bool parse_target_temp_command(const char *text, int *target_temp_c)
+{
+    char command;
+    int value;
+    int parsed;
+
+    if ((text == NULL) || (target_temp_c == NULL))
+    {
+        return false;
+    }
+
+    parsed = sscanf(text, "%c,%d", &command, &value);
+
+    if (parsed != 2)
+    {
+        return false;
+    }
+
+    if ((command != 'T') && (command != 't'))
+    {
+        return false;
+    }
+
+    /*
+     * 시연용 목표온도 범위
+     * 필요하면 -10~e0 등으로 바꿔도 됨
+     */
+    if ((value < 0) || (value > 30))
+    {
+        return false;
+    }
+
+    *target_temp_c = value;
+
+    return true;
+}
+
 static void process_gui_command(int client_index,
                                 int uart_fd,
                                 int client_fds[],
@@ -428,11 +465,53 @@ static void process_gui_command(int client_index,
     command_text = line + 4;
 
     /*
-     * GUI -> Service : CMD,c\n
-     * Service -> STM32: c
+     * Module B 목표온도 설정 명령
      *
-     * STM32 입장에서는 한 글자 명령만 받음.
-     * Enter 필요 없음.
+     * GUI -> Service : CMD,T,25
+     * Service -> STM32: 'T' + 25
+     */
+    if ((command_text[0] == 'T') || (command_text[0] == 't'))
+    {
+        int target_temp_c;
+        char uart_packet[2];
+
+        if (!parse_target_temp_command(command_text, &target_temp_c))
+        {
+            send_to_client(client_fds[client_index],
+                           "SVC,ERR,INVALID_TARGET_TEMP\n");
+            return;
+        }
+
+        uart_packet[0] = 'T';
+        uart_packet[1] = (char)target_temp_c;
+
+        if (write_all(uart_fd, uart_packet, 2U) != 0)
+        {
+            perror("UART target temp write failed");
+
+            send_to_client(client_fds[client_index],
+                           "SVC,ERR,UART_WRITE\n");
+            return;
+        }
+
+        printf("[GUI CMD] STM32 TX : T,%d\n", target_temp_c);
+        fflush(stdout);
+
+        snprintf(response_packet,
+                 sizeof(response_packet),
+                 "SVC,CMD_SENT,T,%d\n",
+                 target_temp_c);
+
+        send_to_client(client_fds[client_index],
+                       response_packet);
+        return;
+    }
+
+    /*
+     * 일반 한 글자 명령
+     *
+     * GUI -> Service : CMD,c
+     * Service -> STM32: c
      */
     if (strlen(command_text) != 1U)
     {

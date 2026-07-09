@@ -1,0 +1,40 @@
+# Build directories
+build/
+pbv_gui/build/
+
+# C/C++ build outputs
+*.o
+*.out
+*.elf
+*.bin
+*.map
+*.a
+*.so
+
+# Executable outputs
+uart_service/pbv_uart_service
+pbv_gui/pbv_hmi
+pbv_gui/pbv_motor_monitor_gui
+pbv_gui/pbv_temperature_gui
+pbv_gui/pbv_weight_monitor_gui
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Qt generated
+*_autogen/
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Python cache
+__pycache__/
+*.pyc
+
+# temp
+*.log
+*.swp
+*~

@@ -7,6 +7,7 @@ class QStackedWidget;
 class TelemetryClient;
 class IdlePage;
 class ModuleAPage;
+class ModuleBPage;
 
 class HmiWindow : public QMainWindow
 {
@@ -38,6 +39,7 @@ private:
     TelemetryClient *m_telemetryClient;
     IdlePage *m_idlePage;
     ModuleAPage *m_moduleAPage;
+    ModuleBPage *m_moduleBPage;
 };
 
 #endif

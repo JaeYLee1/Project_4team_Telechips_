@@ -2,6 +2,7 @@
 
 #include "idle_page.h"
 #include "module_a_page.h"
+#include "module_b_page.h"
 #include "telemetry_client.h"
 
 #include <QStackedWidget>
@@ -11,13 +12,15 @@ HmiWindow::HmiWindow(QWidget *parent)
       m_stack(new QStackedWidget(this)),
       m_telemetryClient(new TelemetryClient(this)),
       m_idlePage(new IdlePage(this)),
-      m_moduleAPage(new ModuleAPage(this))
+      m_moduleAPage(new ModuleAPage(this)),
+      m_moduleBPage(new ModuleBPage(this))
 {
     setWindowTitle("PBV Docking HMI");
     resize(1280, 720);
 
     m_stack->addWidget(m_idlePage);
     m_stack->addWidget(m_moduleAPage);
+    m_stack->addWidget(m_moduleBPage);
 
     setCentralWidget(m_stack);
 
@@ -49,15 +52,12 @@ void HmiWindow::onTelemetryReceived(int moduleType,
                                     int relayState,
                                     int fsmState)
 {
-    Q_UNUSED(currentTempX10)
-    Q_UNUSED(targetTempX10)
-    Q_UNUSED(peltierDuty)
+    Q_UNUSED(pressure)
 
     const double targetRpm = targetRpmX10 / 10.0;
     const double currentRpm = currentRpmX10 / 10.0;
     const double duty = motorDutyX10 / 10.0;
 
-    // IDLE 화면도 계속 최신 상태 유지
     m_idlePage->setDockDetected(detectState == 1);
     m_idlePage->setRelayState(relayState == 1);
     m_idlePage->setFsmState(fsmState, authResult);
@@ -67,7 +67,6 @@ void HmiWindow::onTelemetryReceived(int moduleType,
                                currentRpm,
                                duty);
 
-    // Module A 화면 데이터 갱신
     m_moduleAPage->setSystemStatus(moduleType,
                                    authResult,
                                    detectState,
@@ -82,15 +81,22 @@ void HmiWindow::onTelemetryReceived(int moduleType,
                                   currentRpm,
                                   duty);
 
-    /*
-     * 화면 전환 조건
-     *
-     * moduleType == 1 : Module A
-     * authResult == 1 : 인증 성공
-     * detectState == 1: 물리 장착 감지
-     * relayState == 1 : 릴레이 ON
-     * fsmState == 3   : ACTIVE
-     */
+    m_moduleBPage->setSystemStatus(moduleType,
+                                   authResult,
+                                   detectState,
+                                   relayState,
+                                   fsmState);
+
+    m_moduleBPage->setTemperatureStatus(currentTempX10,
+                                        targetTempX10,
+                                        peltierDuty);
+
+    m_moduleBPage->setMotorStatus(motorRunning,
+                                  motorSpeedLevel,
+                                  targetRpm,
+                                  currentRpm,
+                                  duty);
+
     if ((moduleType == 1) &&
         (authResult == 1) &&
         (detectState == 1) &&
@@ -100,6 +106,17 @@ void HmiWindow::onTelemetryReceived(int moduleType,
         if (m_stack->currentWidget() != m_moduleAPage)
         {
             m_stack->setCurrentWidget(m_moduleAPage);
+        }
+    }
+    else if ((moduleType == 2) &&
+             (authResult == 1) &&
+             (detectState == 1) &&
+             (relayState == 1) &&
+             (fsmState == 3))
+    {
+        if (m_stack->currentWidget() != m_moduleBPage)
+        {
+            m_stack->setCurrentWidget(m_moduleBPage);
         }
     }
     else
@@ -115,4 +132,5 @@ void HmiWindow::onConnectionChanged(bool connected)
 {
     m_idlePage->setServiceConnected(connected);
     m_moduleAPage->setServiceConnected(connected);
+    m_moduleBPage->setServiceConnected(connected);
 }

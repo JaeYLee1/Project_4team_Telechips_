@@ -95,6 +95,8 @@ add_executable(pbv_hmi
     hmi_pages/idle_page.h
     hmi_pages/module_a_page.cpp
     hmi_pages/module_a_page.h
+    hmi_pages/module_b_page.cpp
+    hmi_pages/module_b_page.h
     ${COMMON_SOURCES}
 )
 
