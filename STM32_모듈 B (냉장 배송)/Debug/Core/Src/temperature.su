@@ -1,0 +1,2 @@
+../Core/Src/temperature.c:17:14:Filter	16	static
+../Core/Src/temperature.c:22:6:Temperature_Task	24	static

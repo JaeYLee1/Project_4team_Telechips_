@@ -1,0 +1,11 @@
+../Core/Src/module_manager.c:49:6:ModuleManager_Init	16	static
+../Core/Src/module_manager.c:71:6:ModuleManager_OnAttached	8	static
+../Core/Src/module_manager.c:87:6:ModuleManager_OnDetached	8	static
+../Core/Src/module_manager.c:109:6:ModuleManager_HandleAnnounce	32	static
+../Core/Src/module_manager.c:183:16:ModuleManager_CheckId	24	static
+../Core/Src/module_manager.c:226:13:ModuleManagerTask	16	static
+../Core/Src/module_manager.c:262:13:ModuleManager_SendLinkResult	32	static
+../Core/Src/module_manager.c:280:13:ModuleManager_GetAuthState	4	static
+../Core/Src/module_manager.c:286:14:ModuleManager_GetModuleType	4	static
+../Core/Src/module_manager.c:292:10:ModuleManager_GetModuleId	4	static
+../Core/Src/module_manager.c:298:9:ModuleManager_IsAccepted	4	static

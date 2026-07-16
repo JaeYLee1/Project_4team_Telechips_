@@ -1,0 +1,17 @@
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_weight_monitor_gui.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_temperature_gui.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_motor_monitor_gui.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_hmi.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_power_monitor_gui.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/edit_cache.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/rebuild_cache.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_weight_monitor_gui_autogen_timestamp_deps.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_weight_monitor_gui_autogen.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_temperature_gui_autogen_timestamp_deps.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_temperature_gui_autogen.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_motor_monitor_gui_autogen_timestamp_deps.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_motor_monitor_gui_autogen.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_hmi_autogen_timestamp_deps.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_hmi_autogen.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_power_monitor_gui_autogen_timestamp_deps.dir
+/home/pi08/my/AI/pbv_gui/build/CMakeFiles/pbv_power_monitor_gui_autogen.dir

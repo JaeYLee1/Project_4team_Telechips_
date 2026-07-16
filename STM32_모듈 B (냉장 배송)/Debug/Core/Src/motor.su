@@ -1,0 +1,12 @@
+../Core/Src/motor.c:12:6:Peltier_GPIO_Init	4	static
+../Core/Src/motor.c:22:6:Peltier_Init	8	static
+../Core/Src/motor.c:28:6:Peltier_SetDuty	16	static
+../Core/Src/motor.c:40:6:Peltier_On	4	static
+../Core/Src/motor.c:47:6:Peltier_Off	4	static
+../Core/Src/motor.c:54:6:Fan_GPIO_Init	4	static
+../Core/Src/motor.c:68:6:Fan_PWM_GPIO_Init	4	static
+../Core/Src/motor.c:82:6:Fan_PWM_Init	4	static
+../Core/Src/motor.c:112:6:Fan_Init	8	static
+../Core/Src/motor.c:122:6:Fan_SetDuty	16	static
+../Core/Src/motor.c:149:6:Fan_On	4	static
+../Core/Src/motor.c:155:6:Fan_Off	4	static

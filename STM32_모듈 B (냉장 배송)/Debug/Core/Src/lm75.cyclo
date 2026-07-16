@@ -1,0 +1,4 @@
+../Core/Src/lm75.c:15:6:LM75_Init	1
+../Core/Src/lm75.c:20:19:LM75_ReadTemperature	2
+../Core/Src/lm75.c:36:16:LM75_ReadRaw	2
+../Core/Src/lm75.c:61:14:LM75_ConvertTemp	1

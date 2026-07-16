@@ -1,0 +1,1618 @@
+#define _DEFAULT_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <pthread.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+#define DEFAULT_UART_PORT   "/dev/ttyACM0"
+#define UART_BAUDRATE       B115200
+
+#define SOCKET_PATH         "/tmp/pbv_uart.sock"
+
+#define MAX_CLIENTS         8
+#define LINE_BUFFER_SIZE    192
+#define CLIENT_BUFFER_SIZE  128
+#define SOCKET_PACKET_SIZE  256
+
+#define DEBUG_TELEMETRY_LOG 1
+/* ========================================================================
+ * 공유 메모리 (init.c가 생성/소멸을 담당하는 마스터 SHM에 자식으로 연결)
+ *
+ * 이 서비스는 SHM의 소유자가 아니므로:
+ *   1) shm_open()에 O_CREAT를 절대 쓰지 않는다.
+ *   2) 종료 시 munmap()/close()만 하고 shm_unlink()는 하지 않는다.
+ *
+ * 아래 enum/struct는 init.c에 정의된 SystemSharedData_t와 반드시 1:1로
+ * 일치해야 한다 (필드 순서/타입이 다르면 잘못된 오프셋에 값이 써진다).
+ * ======================================================================== */
+
+#define SHM_NAME            "/sys_shared_memory"
+#define TELEMETRY_FSM_ACTIVE 3
+
+typedef enum
+{
+    SYS_IDLE = 0,
+    SYS_IDENTIFY,
+    SYS_AUTHENTICATE,
+    SYS_NEGOTIATE,
+    SYS_ACTIVE,
+    SYS_FAULT,
+    SYS_QUARANTINE
+} SystemState_t;
+
+typedef enum
+{
+    FAULT_NONE = 0,
+    FAULT_IDENTIFY_TIMEOUT,
+    FAULT_AUTH_FAIL,
+    FAULT_AUTH_TIMEOUT,
+    FAULT_POWER_REJECT,
+    FAULT_NEGOTIATE_TIMEOUT,
+    FAULT_POWER_VIOLATION_MAX
+} FaultCode_t;
+
+typedef enum
+{
+    MODULE_NONE = 0,
+    MODULE_GENERAL,      /* Module A */
+    MODULE_COLD_CHAIN,   /* Module B */
+    MODULE_UNKNOWN
+} ModuleType_t;
+
+typedef struct
+{
+    pthread_mutex_t mutex;
+
+    /* System State */
+    SystemState_t system_state;
+    ModuleType_t module_type;
+    FaultCode_t latest_fault;
+
+    uint32_t module_id;
+
+    uint8_t dock_detected;
+    uint8_t auth_result;
+    uint8_t power_granted;
+    uint8_t module_function_enabled;
+
+    /* Driving */
+    uint32_t target_speed_rpm;
+    uint32_t current_speed_rpm;
+    uint16_t motor_pwm_duty;
+
+    /* Power Policy */
+    uint32_t requested_power_w;
+    uint32_t granted_power_w;
+    uint32_t reported_power_w;
+    uint8_t power_violation_count;
+
+    /* Module A */
+    uint32_t pressure_value;
+
+    /* Module B */
+    uint32_t target_temp_c;
+    uint32_t current_temp_c;
+    uint8_t peltier_pwm;
+    uint8_t fan_pwm;
+
+    /* Warning */
+    uint32_t warning_flag;
+    uint8_t sleep_flag;
+} SystemSharedData_t;
+
+static SystemSharedData_t *g_shm_ptr = MAP_FAILED;
+
+typedef struct
+{
+    int module_type;
+    int auth_result;
+
+    int weight_g;
+
+    int current_temp_x10;
+    int target_temp_x10;
+
+    int motor_running;
+    int motor_speed_level;
+    int target_rpm_x10;
+    int current_rpm_x10;
+    int motor_duty_x10;
+
+    int detect_state;
+    int relay_state;
+    int fsm_state;
+
+    int base_power_mw;
+    int module_b_power_mw;
+    int cooling_power_mw;
+    int motor_power_mw;
+    int total_power_mw;
+
+    int power_warning_count;
+    int power_fault;
+    int power_limit_mw;
+
+} TelemetryData;
+
+static volatile sig_atomic_t g_running = 1;
+
+static char g_client_buffers[MAX_CLIENTS][CLIENT_BUFFER_SIZE];
+static size_t g_client_indexes[MAX_CLIENTS];
+
+static int write_all(int fd, const char *buffer, size_t length);
+
+static void broadcast_packet(const char *packet,
+                             int client_fds[]);
+
+// AI 경고 상태 저장 변수
+static int g_last_ai_warning_level = 0;
+static bool g_critical_ai_latched = false;
+static bool g_ai_ack_suppressed = false;
+static bool g_ai_output_active = false;
+
+// sleep_flag → AI warning level
+static int convert_sleep_flag_to_ai_level(uint8_t sleep_flag)
+{
+    if (sleep_flag == 3U)
+    {
+        return 1;
+    }
+
+    if (sleep_flag == 4U)
+    {
+        return 2;
+    }
+
+    return 0;
+}
+
+// STM32로 AI 경고 명령 보내는 함수
+static void send_ai_warning_to_stm32(int uart_fd, int ai_level)
+{
+    char command;
+
+    if (ai_level == 1)
+    {
+        command = 'A';
+    }
+    else if (ai_level == 2)
+    {
+        command = 'B';
+    }
+    else
+    {
+        command = 'N';
+    }
+
+    if (write_all(uart_fd, &command, 1U) != 0)
+    {
+        perror("[AI WARN] UART write failed");
+        return;
+    }
+
+    printf("[AI WARN] STM32 TX : %c\n", command);
+    fflush(stdout);
+}
+
+//GUI로 AI 경고 전송 함수
+static void broadcast_ai_warning(int ai_level,
+                                 uint8_t sleep_flag,
+                                 int client_fds[])
+{
+    char packet[64];
+    int i;
+    int client_count = 0;
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (client_fds[i] >= 0)
+        {
+            client_count++;
+        }
+    }
+
+    snprintf(packet,
+             sizeof(packet),
+             "WARN,AI,%d,%u\n",
+             ai_level,
+             sleep_flag);
+
+    broadcast_packet(packet, client_fds);
+
+    printf("[AI WARN] GUI TX : WARN,AI,%d,%u | clients=%d\n",
+           ai_level,
+           sleep_flag,
+           client_count);
+    fflush(stdout);
+}
+
+#if 0
+static bool is_ai_warning_allowed(void)
+{
+    bool allowed = false;
+
+    if (g_shm_ptr == MAP_FAILED)
+    {
+        return false;
+    }
+
+    pthread_mutex_lock(&g_shm_ptr->mutex);
+
+    allowed =
+        ((g_shm_ptr->module_type == MODULE_GENERAL) ||
+         (g_shm_ptr->module_type == MODULE_COLD_CHAIN)) &&
+        (g_shm_ptr->auth_result == 1U) &&
+        (g_shm_ptr->dock_detected == 1U) &&
+        (g_shm_ptr->power_granted == 1U) &&
+        (g_shm_ptr->system_state == TELEMETRY_FSM_ACTIVE);
+
+    pthread_mutex_unlock(&g_shm_ptr->mutex);
+
+    return allowed;
+}
+#endif
+
+#if 1
+static void handle_ai_warning_flags(int uart_fd,
+                                    int client_fds[])
+{
+    uint8_t sleep_flag;
+    uint32_t warning_flag;
+    SystemState_t system_state;
+    ModuleType_t module_type;
+    uint8_t auth_result;
+    uint8_t dock_detected;
+    uint8_t power_granted;
+
+    bool allowed;
+    int ai_level;
+
+    static int last_print_sleep_flag = -1;
+    static int last_print_ai_level = -1;
+    static int last_print_allowed = -1;
+    static int last_print_suppress = -1;
+    static int last_print_latched = -1;
+
+    if (g_shm_ptr == MAP_FAILED)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&g_shm_ptr->mutex);
+
+    sleep_flag = g_shm_ptr->sleep_flag;
+    warning_flag = g_shm_ptr->warning_flag;
+    system_state = g_shm_ptr->system_state;
+    module_type = g_shm_ptr->module_type;
+    auth_result = g_shm_ptr->auth_result;
+    dock_detected = g_shm_ptr->dock_detected;
+    power_granted = g_shm_ptr->power_granted;
+
+    pthread_mutex_unlock(&g_shm_ptr->mutex);
+
+    ai_level = convert_sleep_flag_to_ai_level(sleep_flag);
+
+    allowed =
+        ((module_type == MODULE_GENERAL) ||
+         (module_type == MODULE_COLD_CHAIN)) &&
+        (auth_result == 1U) &&
+        (dock_detected == 1U) &&
+        (power_granted == 1U) &&
+        (system_state == TELEMETRY_FSM_ACTIVE);
+
+    /*
+     * 값이 바뀔 때만 출력.
+     * sleep_flag=4가 계속 유지되는지 확인 가능.
+     */
+    if ((last_print_sleep_flag != (int)sleep_flag) ||
+        (last_print_ai_level != ai_level) ||
+        (last_print_allowed != (int)allowed) ||
+        (last_print_suppress != (int)g_ai_ack_suppressed) ||
+        (last_print_latched != (int)g_critical_ai_latched))
+    {
+        printf("[AI FLAG] sleep_flag=%u ai_level=%d warning_flag=%u "
+               "allowed=%d module=%d auth=%u dock=%u relay=%u fsm=%d "
+               "latched=%d suppressed=%d\n",
+               sleep_flag,
+               ai_level,
+               warning_flag,
+               allowed ? 1 : 0,
+               module_type,
+               auth_result,
+               dock_detected,
+               power_granted,
+               system_state,
+               g_critical_ai_latched ? 1 : 0,
+               g_ai_ack_suppressed ? 1 : 0);
+
+        fflush(stdout);
+
+        last_print_sleep_flag = (int)sleep_flag;
+        last_print_ai_level = ai_level;
+        last_print_allowed = (int)allowed;
+        last_print_suppress = (int)g_ai_ack_suppressed;
+        last_print_latched = (int)g_critical_ai_latched;
+    }
+
+    /*
+     * ACTIVE가 아니면 AI 경고 처리하지 않음.
+     * 단, 기존 팝업이 남아 있을 수 있으므로 WARN,AI,0을 한 번 보내는 게 안전함.
+     */
+    if (!allowed)
+    {
+        if (g_ai_output_active)
+        {
+            send_ai_warning_to_stm32(uart_fd, 0);
+            broadcast_ai_warning(0, sleep_flag, client_fds);
+        }
+        else if ((g_last_ai_warning_level != 0) ||
+                (g_critical_ai_latched != false) ||
+                (g_ai_ack_suppressed != false))
+        {
+            broadcast_ai_warning(0, sleep_flag, client_fds);
+        }
+
+        g_last_ai_warning_level = 0;
+        g_critical_ai_latched = false;
+        g_ai_ack_suppressed = false;
+        g_ai_output_active = false;
+        return;
+    }
+
+    /*
+     * 사용자가 ACK/CLEAR를 누른 뒤에는
+     * sleep_flag가 0으로 돌아오기 전까지 같은 Critical 경고를 다시 보내지 않음.
+     */
+    if (g_ai_ack_suppressed)
+    {
+        if (ai_level == 0)
+        {
+            g_ai_ack_suppressed = false;
+            g_last_ai_warning_level = 0;
+            g_critical_ai_latched = false;
+        }
+
+        return;
+    }
+
+    /*
+     * Critical warning은 ACK 전까지 유지.
+     */
+    if (g_critical_ai_latched)
+    {
+        if (ai_level == 0)
+        {
+            g_last_ai_warning_level = 0;
+        }
+
+        return;
+    }
+
+    /*
+     * Level 0: Level 1 경고 해제
+     */
+    if (ai_level == 0)
+    {
+        /*
+        * sleep_flag 0/1/2는 AI 경고 해제 상태.
+        * 직전 상태값이 꼬여도 STM32 출력이 켜진 적 있으면 반드시 N을 보낸다.
+        * 특히 sleep_flag 3 -> 1 전환 시 Level 1 부저를 확실히 끄기 위함.
+        */
+        if ((g_last_ai_warning_level == 1) || g_ai_output_active)
+        {
+            send_ai_warning_to_stm32(uart_fd, 0);
+            broadcast_ai_warning(0, sleep_flag, client_fds);
+
+            g_ai_output_active = false;
+        }
+
+        g_last_ai_warning_level = 0;
+        return;
+    }
+
+    /*
+     * Level 1
+     */
+    if (ai_level == 1)
+    {
+        if (g_last_ai_warning_level == 1)
+        {
+            return;
+        }
+
+        if (g_last_ai_warning_level == 2)
+        {
+            return;
+        }
+
+        g_last_ai_warning_level = 1;
+        g_ai_output_active = true;
+
+        send_ai_warning_to_stm32(uart_fd, 1);
+        broadcast_ai_warning(1, sleep_flag, client_fds);
+        return;
+    }
+
+    /*
+     * Level 2
+     */
+    if (ai_level == 2)
+    {
+        if (g_last_ai_warning_level == 2)
+        {
+            return;
+        }
+
+        g_last_ai_warning_level = 2;
+        g_critical_ai_latched = true;
+        g_ai_output_active = true;
+
+        send_ai_warning_to_stm32(uart_fd, 2);
+        broadcast_ai_warning(2, sleep_flag, client_fds);
+        return;
+    }
+}
+#else
+//공유메모리 sleep_flag 확인 함수
+static void handle_ai_warning_flags(int uart_fd,
+                                    int client_fds[])
+{
+    uint8_t sleep_flag;
+    int ai_level;
+
+    if (g_shm_ptr == MAP_FAILED)
+    {
+        return;
+    }
+
+    /*
+     * Module A/B ACTIVE 상태가 아니면 AI 경고를 처리하지 않는다.
+     */
+    if (!is_ai_warning_allowed())
+    {
+        g_last_ai_warning_level = 0;
+        g_critical_ai_latched = false;
+        g_ai_ack_suppressed = false;
+        return;
+    }
+
+    pthread_mutex_lock(&g_shm_ptr->mutex);
+    sleep_flag = g_shm_ptr->sleep_flag;
+    pthread_mutex_unlock(&g_shm_ptr->mutex);
+
+    ai_level = convert_sleep_flag_to_ai_level(sleep_flag);
+
+    if (g_ai_ack_suppressed)
+    {
+        /*
+        * 사용자가 ACK/CLEAR를 누른 뒤에는
+        * sleep_flag가 정상으로 돌아오기 전까지 같은 Critical 경고를 다시 띄우지 않는다.
+        */
+        if (ai_level == 0)
+        {
+            g_ai_ack_suppressed = false;
+            g_last_ai_warning_level = 0;
+            g_critical_ai_latched = false;
+        }
+
+        return;
+    }
+    /*
+     * Critical warning(Level 2)은 사용자가 ACK/CLEAR 하기 전까지 유지.
+     * 눈을 떠서 ai_level이 0으로 내려가도 STM32에 'N'을 보내지 않는다.
+     */
+    if (g_critical_ai_latched)
+    {
+        if (ai_level == 0)
+        {
+            /*
+             * 다음 경고 재발생을 위해 last level만 0으로 복귀.
+             * 단, critical popup/STM32 상태는 ACK/CLEAR 전까지 유지.
+             */
+            g_last_ai_warning_level = 0;
+        }
+
+        return;
+    }
+
+    /*
+     * Level 1 상태에서 눈을 뜬 경우:
+     * STM32로 'N' 전송 → 부저 OFF
+     * GUI로 WARN,AI,0 전송 → Level 1 경고창 자동 닫힘
+     */
+    if (ai_level == 0)
+    {
+        if (g_last_ai_warning_level == 1)
+        {
+            g_last_ai_warning_level = 0;
+
+            send_ai_warning_to_stm32(uart_fd, 0);
+            broadcast_ai_warning(0, sleep_flag, client_fds);
+        }
+        else
+        {
+            g_last_ai_warning_level = 0;
+        }
+
+        return;
+    }
+
+    /*
+     * Level 1: 부저 경고
+     */
+    if (ai_level == 1)
+    {
+        if (g_last_ai_warning_level == 1)
+        {
+            return;
+        }
+
+        /*
+         * 이미 Level 2가 발생했던 상태라면 Level 1로 다운그레이드하지 않음.
+         */
+        if (g_last_ai_warning_level == 2)
+        {
+            return;
+        }
+
+        g_last_ai_warning_level = 1;
+
+        send_ai_warning_to_stm32(uart_fd, 1);
+        broadcast_ai_warning(1, sleep_flag, client_fds);
+        return;
+    }
+
+    /*
+     * Level 2: Critical warning
+     */
+    if (ai_level == 2)
+    {
+        if (g_last_ai_warning_level == 2)
+        {
+            return;
+        }
+
+        g_last_ai_warning_level = 2;
+        g_critical_ai_latched = true;
+
+        send_ai_warning_to_stm32(uart_fd, 2);
+        broadcast_ai_warning(2, sleep_flag, client_fds);
+        return;
+    }
+}
+#endif
+
+static void signal_handler(int signal_number)
+{
+    (void)signal_number;
+    g_running = 0;
+}
+
+static long long get_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return ((long long)ts.tv_sec * 1000LL)
+           + (ts.tv_nsec / 1000000LL);
+}
+
+static int set_nonblocking(int fd)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL, 0);
+
+    if (flags < 0)
+    {
+        return -1;
+    }
+
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* ------------------------------------------------------------------------
+ * 공유 메모리 연결 / 해제 (자식 프로세스 표준 절차)
+ *
+ * 1. Open  : shm_open(O_RDWR)  -- O_CREAT 금지 (init.c가 이미 만들어둠)
+ * 2. Map   : mmap(sizeof(SystemSharedData_t))
+ * 3. Access: 실제 읽기/쓰기는 각 호출부에서 mutex lock/unlock 후 수행
+ * 4. Clean : munmap + close   -- shm_unlink는 하지 않음 (소유자가 아님)
+ * ------------------------------------------------------------------------ */
+static int attach_shared_memory(void)
+{
+    int shm_fd;
+
+    shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
+
+    if (shm_fd < 0)
+    {
+        perror("[UART_SVC] shm_open failed");
+        return -1;
+    }
+
+    g_shm_ptr = mmap(NULL,
+                      sizeof(SystemSharedData_t),
+                      PROT_READ | PROT_WRITE,
+                      MAP_SHARED,
+                      shm_fd,
+                      0);
+
+    /* mmap 이후에는 매핑된 메모리와 무관하게 fd는 닫아도 된다 */
+    close(shm_fd);
+
+    if (g_shm_ptr == MAP_FAILED)
+    {
+        perror("[UART_SVC] mmap failed");
+        return -1;
+    }
+
+    printf("[UART_SVC] Successfully attached to shared memory.\n");
+
+    return 0;
+}
+
+static void detach_shared_memory(void)
+{
+    if (g_shm_ptr != MAP_FAILED)
+    {
+        munmap(g_shm_ptr, sizeof(SystemSharedData_t));
+        g_shm_ptr = MAP_FAILED;
+
+        printf("[UART_SVC] Detached from shared memory.\n");
+    }
+}
+
+/*
+ * UART로 수신한 TelemetryData를 공유 메모리에 반영한다.
+ * 임계구역 진입/이탈(mutex lock/unlock)을 반드시 지킨다.
+ *
+ * TODO: weight_g -> pressure_value, relay_state -> power_granted 매핑은
+ *       SystemSharedData_t에 전용 필드가 없어 임시로 연결한 것.
+ *       실제 필드 의미가 확정되면 재검토할 것.
+ */
+static void update_shared_memory(const TelemetryData *data)
+{
+    if (g_shm_ptr == MAP_FAILED)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&g_shm_ptr->mutex);
+
+    g_shm_ptr->module_type   = (ModuleType_t)data->module_type;
+    g_shm_ptr->auth_result   = (uint8_t)data->auth_result;
+
+    g_shm_ptr->pressure_value = (uint32_t)data->weight_g;
+
+    g_shm_ptr->current_temp_c = (uint32_t)(data->current_temp_x10 / 10);
+    g_shm_ptr->target_temp_c  = (uint32_t)(data->target_temp_x10 / 10);
+    g_shm_ptr->peltier_pwm = 0U;
+
+    g_shm_ptr->module_function_enabled = (uint8_t)data->motor_running;
+    g_shm_ptr->current_speed_rpm = (uint32_t)(data->current_rpm_x10 / 10);
+    g_shm_ptr->target_speed_rpm  = (uint32_t)(data->target_rpm_x10 / 10);
+    g_shm_ptr->motor_pwm_duty    = (uint16_t)(data->motor_duty_x10 / 10);
+
+    g_shm_ptr->dock_detected  = (uint8_t)data->detect_state;
+    g_shm_ptr->power_granted  = (uint8_t)data->relay_state;
+    g_shm_ptr->system_state   = (SystemState_t)data->fsm_state;
+
+    g_shm_ptr->reported_power_w =
+    (uint32_t)(data->total_power_mw / 1000);
+
+    g_shm_ptr->power_violation_count =
+        (uint8_t)data->power_warning_count;
+
+    pthread_mutex_unlock(&g_shm_ptr->mutex);
+}
+
+static void check_ai_flags(void)
+{
+    return;
+}
+
+static int write_all(int fd, const char *buffer, size_t length)
+{
+    size_t total_written = 0U;
+
+    while (total_written < length)
+    {
+        ssize_t written_size;
+
+        written_size = write(fd,
+                             buffer + total_written,
+                             length - total_written);
+
+        if (written_size < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            return -1;
+        }
+
+        total_written += (size_t)written_size;
+    }
+
+    return 0;
+}
+
+static int open_uart(const char *device_path)
+{
+    int fd;
+    struct termios tty;
+
+    fd = open(device_path, O_RDWR | O_NOCTTY | O_SYNC);
+
+    if (fd < 0)
+    {
+        perror("UART open failed");
+        return -1;
+    }
+
+    if (tcgetattr(fd, &tty) != 0)
+    {
+        perror("tcgetattr failed");
+        close(fd);
+        return -1;
+    }
+
+    cfsetospeed(&tty, UART_BAUDRATE);
+    cfsetispeed(&tty, UART_BAUDRATE);
+
+    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+    tty.c_iflag &= ~(IGNBRK | IXON | IXOFF | IXANY);
+    tty.c_lflag = 0;
+    tty.c_oflag = 0;
+
+    tty.c_cflag |= (CLOCAL | CREAD);
+    tty.c_cflag &= ~(PARENB | PARODD);
+    tty.c_cflag &= ~CSTOPB;
+    tty.c_cflag &= ~CRTSCTS;
+
+    tty.c_cc[VMIN] = 1;
+    tty.c_cc[VTIME] = 0;
+
+    if (tcsetattr(fd, TCSANOW, &tty) != 0)
+    {
+        perror("tcsetattr failed");
+        close(fd);
+        return -1;
+    }
+
+    tcflush(fd, TCIOFLUSH);
+
+    return fd;
+}
+
+static int create_unix_server(void)
+{
+    int server_fd;
+    struct sockaddr_un address;
+
+    unlink(SOCKET_PATH);
+
+    server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    if (server_fd < 0)
+    {
+        perror("Socket create failed");
+        return -1;
+    }
+
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+
+    strncpy(address.sun_path,
+            SOCKET_PATH,
+            sizeof(address.sun_path) - 1U);
+
+    if (bind(server_fd,
+             (struct sockaddr *)&address,
+             sizeof(address)) < 0)
+    {
+        perror("Socket bind failed");
+        close(server_fd);
+        return -1;
+    }
+
+    if (chmod(SOCKET_PATH, 0660) < 0)
+    {
+        perror("Socket chmod failed");
+    }
+
+    if (listen(server_fd, MAX_CLIENTS) < 0)
+    {
+        perror("Socket listen failed");
+        close(server_fd);
+        unlink(SOCKET_PATH);
+        return -1;
+    }
+
+    if (set_nonblocking(server_fd) < 0)
+    {
+        perror("Socket nonblocking setup failed");
+        close(server_fd);
+        unlink(SOCKET_PATH);
+        return -1;
+    }
+
+    return server_fd;
+}
+
+/*
+ * STM32 -> Pi UART Telemetry Format
+ *
+ * TEL,module,auth,weight,temp,target_temp,peltier,
+ *     motor_run,motor_level,target_rpm,current_rpm,duty,
+ *     detect,relay,fsm
+ *
+ * Example:
+ * TEL,0,0,0,250,100,0,0,2,1200,0,0,1,0,1
+ */
+static bool parse_telemetry(const char *line,
+                            TelemetryData *data)
+{
+    int parsed_count;
+
+    if ((line == NULL) || (data == NULL))
+    {
+        return false;
+    }
+
+    memset(data, 0, sizeof(TelemetryData));
+
+    parsed_count = sscanf(
+        line,
+        "RTOS_Data,"
+        "%d,%d,"              /* module_type, auth_result */
+        "%d,"                 /* weight_g */
+        "%d,%d,"              /* current_temp_x10, target_temp_x10 */
+        "%d,%d,%d,%d,%d,"     /* motor_running, motor_level, target_rpm, current_rpm, duty */
+        "%d,%d,%d,"           /* detect_state, relay_state, fsm_state */
+        "%d,%d,%d,%d,%d,"     /* base, module_b, cooling, motor, total power */
+        "%d,%d,%d",           /* warning_count, fault, limit */
+        &data->module_type,
+        &data->auth_result,
+        &data->weight_g,
+        &data->current_temp_x10,
+        &data->target_temp_x10,
+        &data->motor_running,
+        &data->motor_speed_level,
+        &data->target_rpm_x10,
+        &data->current_rpm_x10,
+        &data->motor_duty_x10,
+        &data->detect_state,
+        &data->relay_state,
+        &data->fsm_state,
+        &data->base_power_mw,
+        &data->module_b_power_mw,
+        &data->cooling_power_mw,
+        &data->motor_power_mw,
+        &data->total_power_mw,
+        &data->power_warning_count,
+        &data->power_fault,
+        &data->power_limit_mw
+    );
+
+    return (parsed_count == 21);
+}
+
+static void print_telemetry(const TelemetryData *data)
+{
+    if (data == NULL)
+    {
+        return;
+    }
+
+    printf("[RTOS DATA] "
+           "module=%d | auth=%d | pressure=%d | "
+           "temp=%.1f/%.1f C | "
+           "motor run=%d level=%d rpm=%.1f/%.1f duty=%.1f %% | "
+           "detect=%d relay=%d fsm=%d\n",
+           data->module_type,
+           data->auth_result,
+           data->weight_g,
+           data->current_temp_x10 / 10.0,
+           data->target_temp_x10 / 10.0,
+           data->motor_running,
+           data->motor_speed_level,
+           data->current_rpm_x10 / 10.0,
+           data->target_rpm_x10 / 10.0,
+           data->motor_duty_x10 / 10.0,
+           data->detect_state,
+           data->relay_state,
+           data->fsm_state);
+
+    printf("[POWER DATA] "
+           "base=%.2f W | module_b=%.2f W | cooling=%.2f W | "
+           "motor=%.2f W | module_b_total=%.2f W | limit=%.2f W | "
+           "warning=%d/4 | fault=%d\n",
+           data->base_power_mw / 1000.0,
+           data->module_b_power_mw / 1000.0,
+           data->cooling_power_mw / 1000.0,
+           data->motor_power_mw / 1000.0,
+           data->total_power_mw / 1000.0,
+           data->power_limit_mw / 1000.0,
+           data->power_warning_count,
+           data->power_fault);
+
+    fflush(stdout);
+}
+
+static void remove_client(int client_fds[], int index)
+{
+    if (client_fds[index] >= 0)
+    {
+        close(client_fds[index]);
+        client_fds[index] = -1;
+        g_client_indexes[index] = 0U;
+    }
+}
+
+static void accept_new_clients(int server_fd,
+                               int client_fds[])
+{
+    int client_fd;
+    int i;
+
+    while (1)
+    {
+        client_fd = accept(server_fd, NULL, NULL);
+
+        if (client_fd < 0)
+        {
+            if ((errno == EAGAIN) ||
+                (errno == EWOULDBLOCK))
+            {
+                break;
+            }
+
+            perror("Socket accept failed");
+            break;
+        }
+
+        if (set_nonblocking(client_fd) < 0)
+        {
+            perror("Client nonblocking setup failed");
+            close(client_fd);
+            continue;
+        }
+
+        for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (client_fds[i] < 0)
+            {
+                client_fds[i] = client_fd;
+                g_client_indexes[i] = 0U;
+
+                printf("[IPC] GUI client connected. slot=%d fd=%d\n",
+                       i,
+                       client_fd);
+                fflush(stdout);
+
+                client_fd = -1;
+                break;
+            }
+        }
+
+        if (client_fd >= 0)
+        {
+            printf("[IPC] Client limit reached.\n");
+            fflush(stdout);
+
+            close(client_fd);
+        }
+    }
+}
+
+static void send_to_client(int client_fd,
+                           const char *packet)
+{
+    size_t length;
+    ssize_t sent_size;
+
+    if ((client_fd < 0) || (packet == NULL))
+    {
+        return;
+    }
+
+    length = strlen(packet);
+
+    sent_size = send(client_fd,
+                     packet,
+                     length,
+                     MSG_NOSIGNAL);
+
+    if (sent_size < 0)
+    {
+        if ((errno == EAGAIN) ||
+            (errno == EWOULDBLOCK) ||
+            (errno == EINTR))
+        {
+            return;
+        }
+
+        perror("Client send failed");
+    }
+}
+
+static void broadcast_packet(const char *packet,
+                             int client_fds[])
+{
+    int i;
+    size_t packet_length;
+
+    packet_length = strlen(packet);
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        ssize_t sent_size;
+
+        if (client_fds[i] < 0)
+        {
+            continue;
+        }
+
+        sent_size = send(client_fds[i],
+                         packet,
+                         packet_length,
+                         MSG_NOSIGNAL);
+
+        if ((sent_size <= 0) &&
+            (errno != EAGAIN) &&
+            (errno != EWOULDBLOCK))
+        {
+            printf("[IPC] GUI client disconnected.\n");
+            remove_client(client_fds, i);
+        }
+    }
+}
+
+static bool is_valid_gui_command_char(char command)
+{
+    switch (command)
+    {
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case 'c':
+        case 'C':
+        case 'd':
+        case 'D':
+        case 'r':
+        case 'R':
+        case 'K':
+        case 'k':
+        case 'A':
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static bool parse_target_temp_command(const char *text, int *target_temp_c)
+{
+    char command;
+    int value;
+    int parsed;
+
+    if ((text == NULL) || (target_temp_c == NULL))
+    {
+        return false;
+    }
+
+    parsed = sscanf(text, "%c,%d", &command, &value);
+
+    if (parsed != 2)
+    {
+        return false;
+    }
+
+    if ((command != 'T') && (command != 't'))
+    {
+        return false;
+    }
+
+    /*
+     * 시연용 목표온도 범위
+     * 필요하면 -10~e0 등으로 바꿔도 됨
+     */
+    if ((value < 0) || (value > 30))
+    {
+        return false;
+    }
+
+    *target_temp_c = value;
+
+    return true;
+}
+
+static void process_gui_command(int client_index,
+                                int uart_fd,
+                                int client_fds[],
+                                const char *line)
+{
+    const char *command_text;
+    char command;
+    char response_packet[64];
+
+    if (strncmp(line, "CMD,", 4U) != 0)
+    {
+        send_to_client(client_fds[client_index],
+                       "SVC,ERR,INVALID_PROTOCOL\n");
+        return;
+    }
+
+    command_text = line + 4;
+
+    /*
+     * Module B 목표온도 설정 명령
+     *
+     * GUI -> Service : CMD,T,25
+     * Service -> STM32: 'T' + 25
+     */
+    if ((command_text[0] == 'T') || (command_text[0] == 't'))
+    {
+        int target_temp_c;
+        char uart_packet[2];
+
+        if (!parse_target_temp_command(command_text, &target_temp_c))
+        {
+            send_to_client(client_fds[client_index],
+                           "SVC,ERR,INVALID_TARGET_TEMP\n");
+            return;
+        }
+
+        uart_packet[0] = 'T';
+        uart_packet[1] = (char)target_temp_c;
+
+        if (write_all(uart_fd, uart_packet, 2U) != 0)
+        {
+            perror("UART target temp write failed");
+
+            send_to_client(client_fds[client_index],
+                           "SVC,ERR,UART_WRITE\n");
+            return;
+        }
+
+        printf("[GUI CMD] STM32 TX : T,%d\n", target_temp_c);
+        fflush(stdout);
+
+        snprintf(response_packet,
+                 sizeof(response_packet),
+                 "SVC,CMD_SENT,T,%d\n",
+                 target_temp_c);
+
+        send_to_client(client_fds[client_index],
+                       response_packet);
+        return;
+    }
+
+    /*
+     * 일반 한 글자 명령
+     *
+     * GUI -> Service : CMD,c
+     * Service -> STM32: c
+     */
+    if (strlen(command_text) != 1U)
+    {
+        send_to_client(client_fds[client_index],
+                       "SVC,ERR,INVALID_COMMAND\n");
+        return;
+    }
+
+    command = command_text[0];
+
+    if (!is_valid_gui_command_char(command))
+    {
+        send_to_client(client_fds[client_index],
+                       "SVC,ERR,INVALID_COMMAND\n");
+        return;
+    }
+
+    if (write_all(uart_fd, &command, 1U) != 0)
+    {
+        perror("UART write failed");
+
+        send_to_client(client_fds[client_index],
+                       "SVC,ERR,UART_WRITE\n");
+        return;
+    }
+
+    printf("[GUI CMD] STM32 TX : %c\n", command);
+    fflush(stdout);
+
+    if ((command == 'K') || (command == 'k'))
+    {
+        g_critical_ai_latched = false;
+        g_last_ai_warning_level = 0;
+        g_ai_ack_suppressed = true;
+        g_ai_output_active = false;
+
+        broadcast_ai_warning(0, 0U, client_fds);
+    }
+        
+    snprintf(response_packet,
+             sizeof(response_packet),
+             "SVC,CMD_SENT,%c\n",
+             command);
+
+    send_to_client(client_fds[client_index],
+                   response_packet);
+}
+
+static void process_client_data(int client_index,
+                                int uart_fd,
+                                int client_fds[])
+{
+    char receive_buffer[64];
+    ssize_t received_size;
+    ssize_t i;
+
+    received_size = recv(client_fds[client_index],
+                         receive_buffer,
+                         sizeof(receive_buffer),
+                         0);
+
+    if (received_size < 0)
+    {
+        if ((errno == EAGAIN) ||
+            (errno == EWOULDBLOCK) ||
+            (errno == EINTR))
+        {
+            return;
+        }
+
+        perror("[IPC] GUI client recv failed");
+        remove_client(client_fds, client_index);
+        return;
+    }
+
+    if (received_size == 0)
+    {
+        printf("[IPC] GUI client disconnected. slot=%d\n",
+               client_index);
+        fflush(stdout);
+
+        remove_client(client_fds, client_index);
+        return;
+    }
+
+    for (i = 0; i < received_size; i++)
+    {
+        char received_char = receive_buffer[i];
+
+        if (received_char == '\r')
+        {
+            continue;
+        }
+
+        if (received_char == '\n')
+        {
+            if (g_client_indexes[client_index] > 0U)
+            {
+                g_client_buffers[client_index]
+                                [g_client_indexes[client_index]] = '\0';
+
+                process_gui_command(client_index,
+                                    uart_fd,
+                                    client_fds,
+                                    g_client_buffers[client_index]);
+
+                g_client_indexes[client_index] = 0U;
+            }
+
+            continue;
+        }
+
+        if (g_client_indexes[client_index] <
+            (CLIENT_BUFFER_SIZE - 1U))
+        {
+            g_client_buffers[client_index]
+                            [g_client_indexes[client_index]] =
+                received_char;
+
+            g_client_indexes[client_index]++;
+        }
+        else
+        {
+            printf("[IPC] GUI command buffer overflow.\n");
+            fflush(stdout);
+
+            g_client_indexes[client_index] = 0U;
+        }
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    const char *uart_port = DEFAULT_UART_PORT;
+    long long last_ai_check_ms;
+
+    int uart_fd;
+    int server_fd;
+    int client_fds[MAX_CLIENTS];
+
+    char line_buffer[LINE_BUFFER_SIZE];
+    size_t line_index = 0U;
+
+    char received_char;
+    char socket_packet[SOCKET_PACKET_SIZE];
+
+    TelemetryData telemetry;
+    long long start_ms;
+
+    fd_set read_fds;
+    int max_fd;
+    int select_result;
+    int i;
+
+    if (argc >= 2)
+    {
+        uart_port = argv[1];
+    }
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        client_fds[i] = -1;
+        g_client_indexes[i] = 0U;
+    }
+
+    printf("========================================\n");
+    printf(" PBV UART Service\n");
+    printf(" UART Port   : %s\n", uart_port);
+    printf(" Baud Rate   : 115200\n");
+    printf(" Socket Path : %s\n", SOCKET_PATH);
+    printf("========================================\n");
+
+    uart_fd = open_uart(uart_port);
+
+    if (uart_fd < 0)
+    {
+        return EXIT_FAILURE;
+    }
+
+    server_fd = create_unix_server();
+
+    if (server_fd < 0)
+    {
+        close(uart_fd);
+        return EXIT_FAILURE;
+    }
+
+    if (attach_shared_memory() < 0)
+    {
+        printf("[UART_SVC] Shared memory unavailable "
+               "(init 프로세스가 먼저 실행 중인지 확인).\n");
+        close(server_fd);
+        close(uart_fd);
+        unlink(SOCKET_PATH);
+        return EXIT_FAILURE;
+    }
+
+    printf("UART connected. Waiting for TEL packets...\n");
+
+    start_ms = get_monotonic_ms();
+    last_ai_check_ms = start_ms;
+
+    while (g_running)
+    {
+        struct timeval timeout;
+
+        FD_ZERO(&read_fds);
+
+        FD_SET(uart_fd, &read_fds);
+        FD_SET(server_fd, &read_fds);
+
+        max_fd = (uart_fd > server_fd)
+                     ? uart_fd
+                     : server_fd;
+
+        for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (client_fds[i] >= 0)
+            {
+                FD_SET(client_fds[i], &read_fds);
+
+                if (client_fds[i] > max_fd)
+                {
+                    max_fd = client_fds[i];
+                }
+            }
+        }
+
+        timeout.tv_sec  = 1;
+        timeout.tv_usec = 0;
+
+        select_result = select(max_fd + 1,
+                               &read_fds,
+                               NULL,
+                               NULL,
+                               &timeout);
+
+        if (select_result < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            perror("select failed");
+            break;
+        }
+
+        if (select_result == 0)
+        {
+            check_ai_flags();
+            handle_ai_warning_flags(uart_fd, client_fds);
+
+            last_ai_check_ms = get_monotonic_ms();
+            continue;
+        }
+
+        {
+            long long now_ms;
+
+            now_ms = get_monotonic_ms();
+
+            if ((now_ms - last_ai_check_ms) >= 100LL)
+            {
+                handle_ai_warning_flags(uart_fd, client_fds);
+                last_ai_check_ms = now_ms;
+            }
+        }
+
+        if (FD_ISSET(server_fd, &read_fds))
+        {
+            accept_new_clients(server_fd, client_fds);
+        }
+
+        for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            if ((client_fds[i] >= 0) &&
+                FD_ISSET(client_fds[i], &read_fds))
+            {
+                process_client_data(i,
+                                    uart_fd,
+                                    client_fds);
+            }
+        }
+
+        if (!FD_ISSET(uart_fd, &read_fds))
+        {
+            continue;
+        }
+
+        if (read(uart_fd, &received_char, 1) != 1)
+        {
+            continue;
+        }
+
+        if (received_char == '\r')
+        {
+            continue;
+        }
+
+        if (received_char == '\n')
+        {
+            line_buffer[line_index] = '\0';
+
+            if (line_index > 0U)
+            {
+                if (parse_telemetry(line_buffer, &telemetry))
+                {
+                    //if (DEBUG_TELEMETRY_LOG != 0)
+                    //{
+                    print_telemetry(&telemetry);
+                    //}
+                    
+                    update_shared_memory(&telemetry);
+
+                    snprintf(
+                        socket_packet,
+                        sizeof(socket_packet),
+                        "RTOS_Data,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                        telemetry.module_type,
+                        telemetry.auth_result,
+                        telemetry.weight_g,
+                        telemetry.current_temp_x10,
+                        telemetry.target_temp_x10,
+                        telemetry.motor_running,
+                        telemetry.motor_speed_level,
+                        telemetry.target_rpm_x10,
+                        telemetry.current_rpm_x10,
+                        telemetry.motor_duty_x10,
+                        telemetry.detect_state,
+                        telemetry.relay_state,
+                        telemetry.fsm_state,
+                        telemetry.base_power_mw,
+                        telemetry.module_b_power_mw,
+                        telemetry.cooling_power_mw,
+                        telemetry.motor_power_mw,
+                        telemetry.total_power_mw,
+                        telemetry.power_warning_count,
+                        telemetry.power_fault,
+                        telemetry.power_limit_mw
+                    );
+
+                    broadcast_packet(socket_packet, client_fds);
+                }
+                else if ((strncmp(line_buffer, "OK,", 3U) == 0) ||
+                         (strncmp(line_buffer, "ERR,", 4U) == 0))
+                {
+                    snprintf(socket_packet,
+                             sizeof(socket_packet),
+                             "%s\n",
+                             line_buffer);
+
+                    printf("[STM32 ACK] %s\n", line_buffer);
+                    fflush(stdout);
+
+                    broadcast_packet(socket_packet,
+                                     client_fds);
+                }
+                else
+                {
+                    printf("[UART RX] Unknown line: %s\n",
+                           line_buffer);
+                    fflush(stdout);
+                }
+            }
+
+            line_index = 0U;
+            continue;
+        }
+
+        if (line_index < (LINE_BUFFER_SIZE - 1U))
+        {
+            line_buffer[line_index++] = received_char;
+        }
+        else
+        {
+            printf("[UART RX] Line buffer overflow.\n");
+            line_index = 0U;
+        }
+    }
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        remove_client(client_fds, i);
+    }
+
+    detach_shared_memory();
+
+    close(server_fd);
+    close(uart_fd);
+
+    unlink(SOCKET_PATH);
+
+    printf("\nUART service stopped.\n");
+
+    return EXIT_SUCCESS;
+}
